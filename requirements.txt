@@ -1,0 +1,6 @@
+# Requirements for CrimeDetectionCCTV/Model.py
+numpy>=1.23,<2.0
+opencv-python>=4.8
+torch>=2.0
+scikit-learn>=1.2
+tqdm>=4.66
