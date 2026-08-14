@@ -27,9 +27,11 @@ dist/
 
 # Project outputs
 models/
+models1/
 checkpoints/
 logs/
-
+video_errors.txt
+bad_videos.txt
 # Local datasets
 Dataset/
 

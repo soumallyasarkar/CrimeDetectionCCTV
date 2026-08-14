@@ -1,372 +1,701 @@
-# =========================
-# IMPORTS
-# =========================
+# ==============================================================================
+# INTELLIGENT REAL-TIME CRIME DETECTION SYSTEM - 3D RES-SE CNN DETECTOR
+# ==============================================================================
+
 import os
+import sys
+
+# Configure GPU MIG compatibility environment flags
+# Target MIG Device 1 (UUID: MIG-1f695d4f-ec71-5ad3-a117-778dcddf27d1) — ~16 GB free VRAM
+os.environ["CUDA_VISIBLE_DEVICES"] = "MIG-1f695d4f-ec71-5ad3-a117-778dcddf27d1"
+os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] = "0"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+
+import random
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.multiprocessing as mp
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import classification_report
+
+# Use file system sharing strategy to allow multi-worker DataLoader parallel processing
+mp.set_sharing_strategy('file_system')
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
 from tqdm import tqdm
 
-# =========================
-# GPU OPTIMIZATION
-# =========================
+# ==============================================================================
+# GPU & SEED CONFIGURATION
+# ==============================================================================
+SEED = 42
 
-# Set device
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+set_seed(SEED)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if torch.cuda.is_available():
-    print(f"GPU detected: {torch.cuda.get_device_name(0)}")
-    # Enable TF32 for Ampere/Hopper GPUs
+    print(f"GPU Detected: {torch.cuda.get_device_name(0)}")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    # Enable cuDNN autotuner
-    torch.backends.cudnn.benchmark = True
 else:
-    print("No GPU detected, using CPU")
+    torch.set_num_threads(12)
+    print(f"Using CPU for execution ({torch.get_num_threads()} parallel OpenMP CPU threads).")
 
-# =========================
+# ==============================================================================
 # CONFIGURATION
-# =========================
+# ==============================================================================
 class Config:
-    # Folder that contains the 'Violence' and 'NonViolence' directories
-    ROOT_DATA = "Dataset/Real-life-violence/Real Life Violence Dataset"
-
+    ROOT_DATA = "Dataset/"
     VIOLENCE_DIR = os.path.join(ROOT_DATA, "Violence")
     NON_VIOLENCE_DIR = os.path.join(ROOT_DATA, "NonViolence")
 
-    OUTPUT_DIR = "models"
+    OUTPUT_DIR = "models1"
+    BEST_MODEL_PATH = os.path.join(OUTPUT_DIR, "best_3dcnn_crime_detector.pth")
 
-    INPUT_SHAPE = (30, 128, 128, 3)  # (frames, height, width, channels)
-    BATCH_SIZE = 8                  # Safe for 128x128 on MIG
-    EPOCHS = 50
-    BASE_LR = 1e-4
+    MAX_FRAMES = 24
+    TARGET_SIZE = (128, 128)
+    BATCH_SIZE = 8
+    EPOCHS = 40
+    BASE_LR = 3e-4
+    WEIGHT_DECAY = 1e-4
+    LABEL_SMOOTHING = 0.05
+
+    # Early Stopping Settings
+    EARLY_STOP_PATIENCE   = 8      # Stop if val acc doesn't improve for 8 consecutive epochs
+    OVERFIT_GAP_THRESHOLD = 15.0   # Stop if train_acc > val_acc by more than 15%
 
 VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.m4v', '.wmv')
 
-# =========================
-# VIDEO FRAME LOADER
-# =========================
-def load_video_frames(video_path, target_size=(128, 128), max_frames=30):
+# ==============================================================================
+# DATASET LOADER & AUGMENTATION
+# ==============================================================================
+# ============================================================
+# FULL VIDEO → MULTIPLE CLIPS DATASET
+# ============================================================
+
+def load_all_video_frames(
+    video_path,
+    target_size=Config.TARGET_SIZE
+):
     """
-    Reads a video and extracts fixed number of frames.
-    Pads frames if video is shorter.
+    Read the ENTIRE video.
+
+    Returns:
+        frames: numpy array
+        shape = (T, H, W, C)
     """
-    try:
+
+    cap = cv2.VideoCapture(video_path)
+
+    frames = []
+
+    if not cap.isOpened():
+        print(f"Warning: Could not open {video_path}")
+        return None
+
+    while True:
+
+        ret, frame = cap.read()
+
+        if not ret:
+            break
+
+        frame = cv2.resize(
+            frame,
+            target_size
+        )
+
+        frame = frame.astype(
+            np.float32
+        ) / 255.0
+
+        frames.append(frame)
+
+    cap.release()
+
+    if len(frames) == 0:
+        return None
+
+    return np.array(frames, dtype=np.float32)
+
+
+def compute_motion(frames):
+    """
+    Compute frame-to-frame motion.
+
+    Input:
+        (T, H, W, C)
+
+    Output:
+        (T, H, W, C)
+    """
+
+    if len(frames) <= 1:
+        return np.zeros_like(frames)
+
+    motion = np.abs(
+        np.diff(frames, axis=0)
+    )
+
+    # Repeat first motion frame
+    first_motion = motion[0:1]
+
+    motion = np.concatenate(
+        [first_motion, motion],
+        axis=0
+    )
+
+    # Same representation used in the original model
+    blended = (
+        0.7 * frames +
+        0.3 * motion
+    )
+
+    return blended
+
+
+class FullVideoClipDataset(Dataset):
+
+    def __init__(
+        self,
+        video_paths,
+        labels,
+        augment=False,
+        stride=None
+    ):
+
+        self.video_paths = video_paths
+        self.labels = labels
+        self.augment = augment
+
+        # Number of frames between two clips
+        #
+        # None = non-overlapping clips
+        #
+        # Example:
+        # 24-frame clip
+        # stride = 24
+        #
+        # For more coverage:
+        # stride = 12
+        #
+        if stride is None:
+            self.stride = Config.MAX_FRAMES
+        else:
+            self.stride = stride
+
+        # Build clip index
+        self.clip_index = []
+
+        print("\nBuilding full-video clip index...")
+
+        for video_idx, video_path in enumerate(video_paths):
+
+            cap = cv2.VideoCapture(video_path)
+
+            if not cap.isOpened():
+                print(
+                    f"Warning: Cannot open {video_path}"
+                )
+                continue
+
+            total_frames = int(
+                cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            )
+
+            cap.release()
+
+            if total_frames <= 0:
+                continue
+
+            clip_size = Config.MAX_FRAMES
+
+            # Generate clips throughout ENTIRE video
+            start = 0
+
+            while start < total_frames:
+
+                # Keep only clips that contain frames
+                if start < total_frames:
+
+                    self.clip_index.append(
+                        (
+                            video_idx,
+                            start
+                        )
+                    )
+
+                start += self.stride
+
+        print(
+            f"Videos: {len(video_paths)}"
+        )
+
+        print(
+            f"Total training clips: "
+            f"{len(self.clip_index)}"
+        )
+
+
+    def __len__(self):
+
+        return len(self.clip_index)
+
+
+    def __getitem__(self, idx):
+
+        video_idx, start_frame = self.clip_index[idx]
+
+        video_path = self.video_paths[video_idx]
+
+        label = self.labels[video_idx]
+
+        # ----------------------------------------------------
+        # Open video
+        # ----------------------------------------------------
+
         cap = cv2.VideoCapture(video_path)
+
+        cap.set(
+            cv2.CAP_PROP_POS_FRAMES,
+            start_frame
+        )
+
         frames = []
 
-        while len(frames) < max_frames:
+        while len(frames) < Config.MAX_FRAMES:
+
             ret, frame = cap.read()
+
             if not ret:
                 break
 
-            frame = cv2.resize(frame, target_size)
-            frame = frame.astype("float32") / 255.0
+            frame = cv2.resize(
+                frame,
+                Config.TARGET_SIZE
+            )
+
+            frame = frame.astype(
+                np.float32
+            ) / 255.0
+
             frames.append(frame)
 
         cap.release()
 
+        # ----------------------------------------------------
+        # Invalid video
+        # ----------------------------------------------------
+
         if len(frames) == 0:
-            return None
 
-        # Pad last frame if needed
-        while len(frames) < max_frames:
-            frames.append(frames[-1])
+            frames = np.zeros(
+                (
+                    Config.MAX_FRAMES,
+                    Config.TARGET_SIZE[0],
+                    Config.TARGET_SIZE[1],
+                    3
+                ),
+                dtype=np.float32
+            )
 
-        return frames[:max_frames]
-    except Exception as e:
-        print(f"Error loading {video_path}: {e}")
-        return None
-
-# =========================
-# MOTION COMPUTATION
-# =========================
-def compute_motion(frames):
-    """
-    Computes frame-to-frame difference to highlight motion
-    """
-    motion_frames = []
-    for i in range(1, len(frames)):
-        diff = np.abs(frames[i] - frames[i-1])
-        motion_frames.append(diff)
-
-    motion_frames.insert(0, motion_frames[0])
-    return np.array(motion_frames)
-
-# =========================
-# LAZY LOADING DATASET
-# =========================
-class LazyVideoDataset(Dataset):
-    """
-    Dataset that loads videos on-the-fly instead of loading all into memory
-    """
-    def __init__(self, video_paths, labels):
-        self.video_paths = video_paths
-        self.labels = labels
-    
-    def __len__(self):
-        return len(self.video_paths)
-    
-    def __getitem__(self, idx):
-        # Load video on demand
-        frames = load_video_frames(self.video_paths[idx])
-        
-        if frames is None:
-            # Return zeros if video fails to load
-            motion = np.zeros((30, 128, 128, 3), dtype=np.float32)
         else:
-            motion = compute_motion(frames)
-        
-        # Convert to PyTorch format: (C, T, H, W)
-        motion_tensor = torch.FloatTensor(motion).permute(3, 0, 1, 2)
-        label_tensor = torch.FloatTensor([self.labels[idx]])
-        
-        return motion_tensor, label_tensor
 
-# =========================
-# DATASET PREPARATION
-# =========================
+            frames = np.array(
+                frames,
+                dtype=np.float32
+            )
+
+            # ------------------------------------------------
+            # Pad final clip
+            # ------------------------------------------------
+
+            while len(frames) < Config.MAX_FRAMES:
+
+                frames = np.concatenate(
+                    [
+                        frames,
+                        frames[-1:]
+                    ],
+                    axis=0
+                )
+
+        frames = frames[
+            :Config.MAX_FRAMES
+        ]
+
+        # ----------------------------------------------------
+        # AUGMENTATION
+        # ----------------------------------------------------
+
+        if self.augment:
+
+            # Horizontal flip
+            if random.random() > 0.5:
+
+                frames = np.flip(
+                    frames,
+                    axis=2
+                ).copy()
+
+            # Brightness / contrast
+            if random.random() > 0.5:
+
+                alpha = random.uniform(
+                    0.85,
+                    1.15
+                )
+
+                beta = random.uniform(
+                    -0.1,
+                    0.1
+                )
+
+                frames = np.clip(
+                    frames * alpha + beta,
+                    0.0,
+                    1.0
+                )
+
+        # ----------------------------------------------------
+        # Motion
+        # ----------------------------------------------------
+
+        blended = compute_motion(frames)
+
+        # ----------------------------------------------------
+        # Convert:
+        #
+        # (T,H,W,C)
+        #
+        # →
+        #
+        # (C,T,H,W)
+        # ----------------------------------------------------
+
+        frames_tensor = torch.FloatTensor(
+            blended
+        ).permute(
+            3,
+            0,
+            1,
+            2
+        )
+
+        label_tensor = torch.FloatTensor(
+            [label]
+        )
+
+        return frames_tensor, label_tensor
+# ==============================================================================
+# STRATIFIED DATASET PREPARATION
+# ==============================================================================
 def prepare_dataset():
-    """
-    Prepares file paths and labels without loading videos
-    """
-    def load_files(folder):
+    def get_files(folder):
         return sorted([
             os.path.join(folder, f) for f in os.listdir(folder)
             if f.lower().endswith(VIDEO_EXTENSIONS)
         ])
 
-    vio_files = load_files(Config.VIOLENCE_DIR)
-    non_files = load_files(Config.NON_VIOLENCE_DIR)
+    vio_files = get_files(Config.VIOLENCE_DIR)
+    non_files = get_files(Config.NON_VIOLENCE_DIR)
 
-    print(f"Found {len(vio_files)} violent videos")
-    print(f"Found {len(non_files)} non-violent videos")
+    all_paths = vio_files + non_files
+    all_labels = [1] * len(vio_files) + [0] * len(non_files)
 
-    # Simple split (900 train / 100 test)
-    train_vio, test_vio = vio_files[:900], vio_files[900:1000]
-    train_non, test_non = non_files[:900], non_files[900:1000]
+    # 80% train, 20% temp (val + test)
+    train_paths, temp_paths, train_labels, temp_labels = train_test_split(
+        all_paths, all_labels, test_size=0.20, stratify=all_labels, random_state=SEED
+    )
 
-    # Prepare paths and labels
-    train_paths = train_vio + train_non
-    train_labels = [1] * len(train_vio) + [0] * len(train_non)
-    
-    test_paths = test_vio + test_non
-    test_labels = [1] * len(test_vio) + [0] * len(test_non)
+    # Split 20% temp into 10% val and 10% test
+    val_paths, test_paths, val_labels, test_labels = train_test_split(
+        temp_paths, temp_labels, test_size=0.50, stratify=temp_labels, random_state=SEED
+    )
 
-    print(f"Training samples: {len(train_paths)}")
-    print(f"Test samples: {len(test_paths)}")
+    print(f"Dataset Split Summary:")
+    print(f"  Total Videos      : {len(all_paths)}")
+    print(f"  Training Set      : {len(train_paths)} samples")
+    print(f"  Validation Set    : {len(val_paths)} samples")
+    print(f"  Test Set          : {len(test_paths)} samples")
 
-    return train_paths, train_labels, test_paths, test_labels
+    return train_paths, train_labels, val_paths, val_labels, test_paths, test_labels
 
-# =========================
-# 3D CNN MODEL
-# =========================
-class CNN3D(nn.Module):
+# ==============================================================================
+# 3D RES-SE CNN ARCHITECTURE
+# ==============================================================================
+class SEBlock3D(nn.Module):
     """
-    Deep 3D CNN optimized for spatiotemporal learning
+    3D Squeeze-and-Excitation Motion Attention Module
     """
-    def __init__(self, input_channels=3):
-        super(CNN3D, self).__init__()
-        
-        # -------- Block 1 --------
-        self.block1 = nn.Sequential(
-            nn.Conv3d(input_channels, 32, kernel_size=3, padding=1),
-            nn.BatchNorm3d(32),
-            nn.ReLU(),
-            nn.MaxPool3d(kernel_size=(1, 2, 2))
-        )
-        
-        # -------- Block 2 --------
-        self.block2 = nn.Sequential(
-            nn.Conv3d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(),
-            nn.MaxPool3d(kernel_size=(1, 2, 2))
-        )
-        
-        # -------- Block 3 --------
-        self.block3 = nn.Sequential(
-            nn.Conv3d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm3d(128),
-            nn.ReLU(),
-            nn.MaxPool3d(kernel_size=(1, 2, 2))
-        )
-        
-        # Global Average Pooling
-        self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
-        
-        # Fully Connected Layers
+    def __init__(self, channels, reduction=16):
+        super(SEBlock3D, self).__init__()
+        reduced_ch = max(channels // reduction, 8)
         self.fc = nn.Sequential(
-            nn.Linear(128, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 1),
+            nn.AdaptiveAvgPool3d(1),
+            nn.Flatten(),
+            nn.Linear(channels, reduced_ch),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced_ch, channels),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
+        b, c, _, _, _ = x.size()
+        weight = self.fc(x).view(b, c, 1, 1, 1)
+        return x * weight
+
+class ResBlock3D(nn.Module):
+    """
+    3D Residual Block with BatchNorm, ReLU, and SE Motion Attention
+    """
+    def __init__(self, in_channels, out_channels, stride=(1, 2, 2)):
+        super(ResBlock3D, self).__init__()
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm3d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm3d(out_channels)
+        self.se = SEBlock3D(out_channels)
+
+        if stride != (1, 1, 1) or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm3d(out_channels)
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        out = self.relu(out + residual)
+        return out
+
+class CNN3D_ResSE(nn.Module):
+    """
+    Lightweight 3D Res-SE CNN optimized for Crime Detection (~2.6M parameters)
+    """
+    def __init__(self, input_channels=3):
+        super(CNN3D_ResSE, self).__init__()
+        
+        # Entry Conv Block
+        self.stem = nn.Sequential(
+            nn.Conv3d(input_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool3d(kernel_size=(1, 2, 2))
+        )
+        
+        # Residual Blocks with Squeeze-and-Excitation
+        self.layer1 = ResBlock3D(32, 32, stride=(1, 1, 1))
+        self.layer2 = ResBlock3D(32, 64, stride=(1, 2, 2))
+        self.layer3 = ResBlock3D(64, 128, stride=(1, 2, 2))
+        self.layer4 = ResBlock3D(128, 256, stride=(2, 2, 2))
+        
+        # Global Pooling & Fully Connected Head
+        self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.fc = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
         x = self.global_pool(x)
         x = x.view(x.size(0), -1)
         x = self.fc(x)
         return x
 
-# =========================
-# TRAINING FUNCTION
-# =========================
-def train_model(model, train_loader, criterion, optimizer, scheduler, epochs):
-    """
-    Training loop with proper progress tracking
-    """
+# Backward Compatibility Alias
+CNN3D = CNN3D_ResSE
+
+# ==============================================================================
+# TRAINING & EVALUATION FUNCTIONS
+# ==============================================================================
+def train_epoch(model, train_loader, criterion, optimizer, scaler, device):
     model.train()
+    running_loss, correct, total = 0.0, 0, 0
     
-    for epoch in range(epochs):
-        print(f"\n{'='*50}")
-        print(f"Epoch {epoch+1}/{epochs}")
-        print(f"{'='*50}")
+    pbar = tqdm(train_loader, desc="Training", unit="batch", leave=False)
+    for inputs, labels in pbar:
+        inputs, labels = inputs.to(device), labels.to(device)
         
-        epoch_loss = 0
-        correct = 0
-        total = 0
+        optimizer.zero_grad()
+        if device.type == "cuda":
+            with torch.cuda.amp.autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
         
-        # Progress bar for batches
-        pbar = tqdm(train_loader, desc=f"Training", unit="batch")
+        running_loss += loss.item() * inputs.size(0)
+        probs = torch.sigmoid(outputs)
+        predicted = (probs > 0.5).float()
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
         
-        for batch_idx, (inputs, labels) in enumerate(pbar):
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            
-            # Forward pass
-            optimizer.zero_grad()
+        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100 * correct / total:.2f}%'})
+
+    return running_loss / total, 100.0 * correct / total
+
+def eval_epoch(model, dataloader, criterion, device):
+    model.eval()
+    running_loss, correct, total = 0.0, 0, 0
+    y_true, y_pred = [], []
+    
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             
-            # Backward pass
-            loss.backward()
-            optimizer.step()
-            
-            # Statistics
-            epoch_loss += loss.item()
-            predicted = (outputs > 0.5).float()
+            running_loss += loss.item() * inputs.size(0)
+            probs = torch.sigmoid(outputs)
+            predicted = (probs > 0.5).float()
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{100 * correct / total:.2f}%'
-            })
-        
-        avg_loss = epoch_loss / len(train_loader)
-        accuracy = 100 * correct / total
-        
-        print(f"\nEpoch {epoch+1} Summary:")
-        print(f"  Average Loss: {avg_loss:.4f}")
-        print(f"  Accuracy: {accuracy:.2f}%")
-        
-        # Step the scheduler
-        scheduler.step(avg_loss)
-        
-        # Save checkpoint every 10 epochs
-        if (epoch + 1) % 10 == 0:
-            checkpoint_path = os.path.join(Config.OUTPUT_DIR, f"checkpoint_epoch_{epoch+1}.pth")
-            torch.save(model.state_dict(), checkpoint_path)
-            print(f"  Checkpoint saved: {checkpoint_path}")
 
-# =========================
-# EVALUATION FUNCTION
-# =========================
-def evaluate_model(model, test_loader):
-    """
-    Evaluates model on test set
-    """
-    model.eval()
-    
-    y_true = []
-    y_pred = []
-    
-    print("\nEvaluating on test set...")
-    
-    with torch.no_grad():
-        for inputs, labels in tqdm(test_loader, desc="Testing", unit="batch"):
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            
-            outputs = model(inputs)
-            predicted = (outputs > 0.5).float()
-            
-            y_true.extend(labels.cpu().numpy())
-            y_pred.extend(predicted.cpu().numpy())
-    
-    # Classification report
-    y_true = np.array(y_true).flatten()
-    y_pred = np.array(y_pred).flatten()
-    
-    print("\n" + "="*50)
-    print("CLASSIFICATION REPORT")
-    print("="*50)
-    print(classification_report(y_true, y_pred, target_names=['Non-Violent', 'Violent']))
+            y_true.extend(labels.cpu().numpy().flatten())
+            y_pred.extend(predicted.cpu().numpy().flatten())
 
-# =========================
-# MAIN EXECUTION
-# =========================
+    acc = 100.0 * correct / total
+    avg_loss = running_loss / total
+    return avg_loss, acc, np.array(y_true), np.array(y_pred)
+
+# ==============================================================================
+# MAIN EXECUTION PIPELINE
+# ==============================================================================
 def main():
-    # Create output directory
     os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
-    
-    # Prepare dataset (without loading videos)
-    train_paths, train_labels, test_paths, test_labels = prepare_dataset()
-    
-    # Create lazy-loading datasets
-    train_dataset = LazyVideoDataset(train_paths, train_labels)
-    test_dataset = LazyVideoDataset(test_paths, test_labels)
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=Config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=torch.cuda.is_available()
+
+    # Dry Run check flag
+    if "--dry-run" in sys.argv:
+        print("\n--- DRY RUN SANITY CHECK ---")
+        model = CNN3D_ResSE().to(device)
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"3D Res-SE CNN Model Loaded. Total Parameters: {total_params:,}")
+        dummy_input = torch.randn(2, 3, Config.MAX_FRAMES, Config.TARGET_SIZE[0], Config.TARGET_SIZE[1]).to(device)
+        out = model(dummy_input)
+        print(f"Forward pass output shape: {out.shape}")
+        print("Dry run completed successfully.")
+        return
+
+    # Prepare datasets
+    train_paths, train_labels, val_paths, val_labels, test_paths, test_labels = prepare_dataset()
+
+    train_dataset = FullVideoClipDataset(
+    train_paths,
+    train_labels,
+    augment=True,
+    stride=12
     )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=Config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=torch.cuda.is_available()
+
+    val_dataset = FullVideoClipDataset(
+        val_paths,
+        val_labels,
+        augment=False,
+        stride=24
     )
-    
-    # Initialize model
-    print("\nInitializing model...")
-    model = CNN3D(input_channels=3).to(device)
-    
-    # Loss and optimizer
-    criterion = nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=Config.BASE_LR)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
+
+    test_dataset = FullVideoClipDataset(
+        test_paths,
+        test_labels,
+        augment=False,
+        stride=24
     )
+
+    num_workers = 0
+
+    train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=num_workers)
+    val_loader   = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False, num_workers=num_workers)
+    test_loader  = DataLoader(test_dataset, batch_size=Config.BATCH_SIZE, shuffle=False, num_workers=num_workers)
+
+    # Model & Optimization
+    model = CNN3D_ResSE().to(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"\nModel Initialized: 3D Res-SE CNN (Total Parameters: {total_params:,})")
+
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=Config.BASE_LR, weight_decay=Config.WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.EPOCHS, eta_min=1e-6)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+
+    best_val_acc = 0.0
+    no_improve_count = 0     # Tracks consecutive epochs without val improvement
+    prev_val_acc    = 0.0    # Tracks previous epoch val acc for divergence check
+
+    print("\nStarting Training Pipeline...")
+    print("=" * 65)
+
+    for epoch in range(Config.EPOCHS):
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scaler, device)
+        val_loss, val_acc, _, _ = eval_epoch(model, val_loader, criterion, device)
+        scheduler.step()
+
+        print(f"Epoch [{epoch+1:02d}/{Config.EPOCHS:02d}] | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
+
+        # Save best checkpoint
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            no_improve_count = 0
+            torch.save(model.state_dict(), Config.BEST_MODEL_PATH)
+            print(f"  --> Best Checkpoint Saved! (Val Accuracy: {best_val_acc:.2f}%)")
+        else:
+            no_improve_count += 1
+
+        # ─── Early Stopping Logic ─────────────────────────────────────────────
+        # Overfitting check: train acc >> val acc by more than threshold
+        overfit_gap = train_acc - val_acc
+        if overfit_gap > Config.OVERFIT_GAP_THRESHOLD and epoch > 15:
+            print(f"\n[Early Stop] Severe overfitting detected! Train Acc ({train_acc:.2f}%) >> Val Acc ({val_acc:.2f}%) by {overfit_gap:.2f}%. Stopping.")
+            break
+
+        # Patience check: stop only if best validation accuracy hasn't improved for PATIENCE epochs
+        if no_improve_count >= Config.EARLY_STOP_PATIENCE:
+            print(f"\n[Early Stop] Val accuracy did not improve for {Config.EARLY_STOP_PATIENCE} consecutive epochs (best: {best_val_acc:.2f}%). Stopping.")
+            break
+        # ─────────────────────────────────────────────────────────────────────
+
+    # Evaluate Best Checkpoint on Test Set
+    print("\n" + "=" * 65)
+    print("EVALUATING BEST MODEL CHECKPOINT ON TEST SET")
+    print("=" * 65)
     
-    # Train model
-    print("\nStarting training...")
-    train_model(model, train_loader, criterion, optimizer, scheduler, Config.EPOCHS)
+    if os.path.exists(Config.BEST_MODEL_PATH):
+        model.load_state_dict(torch.load(Config.BEST_MODEL_PATH, map_location=device))
     
-    # Evaluate model
-    evaluate_model(model, test_loader)
+    test_loss, test_acc, y_true, y_pred = eval_epoch(model, test_loader, criterion, device)
     
-    # Save final model
-    final_model_path = os.path.join(Config.OUTPUT_DIR, "violence_detection_model.pth")
-    torch.save(model.state_dict(), final_model_path)
-    print(f"\n{'='*50}")
-    print(f"Final model saved to: {final_model_path}")
-    print(f"{'='*50}")
+    print(f"\nFinal Test Accuracy: {test_acc:.2f}%")
+    print("\nCLASSIFICATION REPORT:")
+    print(classification_report(y_true, y_pred, target_names=['Non-Violent', 'Violent'], digits=4))
 
 if __name__ == "__main__":
     main()
