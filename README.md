@@ -110,7 +110,7 @@ To solve the dual challenge of **real-time scalability** and **deep forensic pre
 
 ### Visual Architecture Diagram
 
-![System Architecture](Architecture.jpeg)
+![System Architecture](system_design.png)
 
 ---
 
