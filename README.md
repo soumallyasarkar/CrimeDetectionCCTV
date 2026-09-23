@@ -1,4 +1,4 @@
-# 🚨 Intelligent Real-Time Crime Detection System Using CCTV Footage
+# Intelligent Real-Time Crime Detection System Using CCTV Footage
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C.svg)](https://pytorch.org/)
@@ -8,7 +8,7 @@
 
 ---
 
-## 📌 Executive Summary
+## Executive Summary
 
 Modern surveillance networks generate petabytes of CCTV video feeds daily. Despite ubiquitous deployment, traditional surveillance operations still rely overwhelmingly on **manual human monitoring**. This model suffers from severe operator fatigue, slow response latency, missed anomalies, and the permanent loss of critical early evidence.
 
@@ -16,7 +16,7 @@ This project delivers an **Intelligent Real-Time Crime Detection System** that t
 
 ---
 
-## ❗ Problem Statement
+## Problem Statement
 
 Conventional CCTV infrastructures face critical operational bottlenecks:
 - **Human Supervision Bottleneck:** Human monitors lose focus after only 20 minutes of continuous surveillance.
@@ -26,7 +26,7 @@ Conventional CCTV infrastructures face critical operational bottlenecks:
 
 ---
 
-## 💡 Proposed Solution: Two-Tier Triggered Architecture
+## Proposed Solution: Two-Tier Triggered Architecture
 
 To solve the dual challenge of **real-time scalability** and **deep forensic precision**, the system operates in two strategic tiers:
 
@@ -38,9 +38,9 @@ To solve the dual challenge of **real-time scalability** and **deep forensic pre
 2. **Tier 2 — Triggered On-Demand Forensic Dispatch**:
    - Activated **only** upon an incident trigger from Tier 1, retrieving the native-resolution video segment from the storage buffer.
    - Concurrently invokes three specialized forensic models:
-     - 🔍 **What Happened?** ➔ **SlowFast Network**: Multi-class crime action classification (e.g., Fighting, Assault, Robbery, Arson, Vandalism).
-     - 🗡️ **How Was It Done?** ➔ **YOLOv5 / YOLOv8**: Weapon and threat object detection (handguns, knives, bats, masks).
-     - 👤 **Who Did It?** ➔ **RetinaFace + ArcFace**: Face detection, facial landmark alignment, 512-D embedding extraction, and cosine similarity matching against a database of known offenders.
+     -  **What Happened?** ➔ **SlowFast Network**: Multi-class crime action classification (e.g., Fighting, Assault, Robbery, Arson, Vandalism).
+     -  **How Was It Done?** ➔ **YOLOv5 / YOLOv8**: Weapon and threat object detection (handguns, knives, bats, masks).
+     -  **Who Did It?** ➔ **RetinaFace + ArcFace**: Face detection, facial landmark alignment, 512-D embedding extraction, and cosine similarity matching against a database of known offenders.
 
 3. **Automated Incident Dossier & Police Alert**:
    - Aggregates findings into a standardized **JSON Dossier** and a printable **PDF Incident Report** containing timestamp, GPS location, camera ID, weapon crops, suspect face matches, and video clips.
@@ -51,7 +51,7 @@ To solve the dual challenge of **real-time scalability** and **deep forensic pre
 
 ---
 
-## 🧠 System Architecture
+##  System Architecture
 
 ### Architectural Pipeline Flowchart
 
@@ -114,7 +114,7 @@ To solve the dual challenge of **real-time scalability** and **deep forensic pre
 
 ---
 
-## 📊 Summary Phase Matrix
+##  Summary Phase Matrix
 
 | Phase | Core Technology | Primary Function | Trigger Mechanism | Output / Evidence | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -127,7 +127,7 @@ To solve the dual challenge of **real-time scalability** and **deep forensic pre
 
 ---
 
-## 🔍 Detailed Phase Breakdown
+##  Detailed Phase Breakdown
 
 ### Phase 1: 3D-CNN Binary Detector (Active)
 - **Model**: `CNN3D_ResSE` (~2.6M parameters), implemented in `Model.py`.
@@ -168,7 +168,7 @@ To solve the dual challenge of **real-time scalability** and **deep forensic pre
 
 ---
 
-## 📄 Incident Dispatch Schema (Police API Contract)
+##  Incident Dispatch Schema (Police API Contract)
 
 When an incident triggers Tier 2 analysis, an automated intelligence dossier is synthesized:
 
@@ -219,7 +219,7 @@ When an incident triggers Tier 2 analysis, an automated intelligence dossier is 
 
 ---
 
-## 🛠️ Technologies & Dependencies
+##  Technologies & Dependencies
 
 | Domain | Tools & Libraries |
 | :--- | :--- |
@@ -233,7 +233,7 @@ When an incident triggers Tier 2 analysis, an automated intelligence dossier is 
 
 ---
 
-## 📂 Project Structure
+##  Project Structure
 
 ```bash
 CrimeDetectionCCTV/
@@ -257,7 +257,7 @@ CrimeDetectionCCTV/
 
 ---
 
-## 🚀 Getting Started
+##  Getting Started
 
 ### 1. Prerequisites
 - **Operating System:** Linux (Ubuntu 20.04+ recommended) or Windows 10/11
@@ -307,7 +307,7 @@ python test_Model.py
 
 ---
 
-## 📈 Roadmap & Milestones
+##  Roadmap & Milestones
 
 - [x] **Phase 1: 3D-CNN Binary Architecture** (`CNN3D_ResSE` with SE Motion Attention)
 - [x] **Phase 1: Dataset Verification & Preprocessing Pipeline** (`video_check.py`, `Model.py`)
@@ -321,6 +321,6 @@ python test_Model.py
 
 ---
 
-## 📜 License & Acknowledgements
+##  License & Acknowledgements
 
 This project is developed for intelligent real-time surveillance and public safety enhancement. Dataset sources include standard violence detection benchmarks and CCTV surveillance archives.
