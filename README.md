@@ -110,29 +110,7 @@ To solve the dual challenge of **real-time scalability** and **deep forensic pre
 
 ### Visual Architecture Diagram
 
-![System Architecture](Doc/Architecture.jpeg)
-
-```mermaid
-flowchart TD
-    CAM[CCTV Camera Feed] -->|15 FPS Downsampled| P1[Phase 1: 3D-CNN Binary Detector\n24/7 Continuous Crime vs No-Crime]
-    CAM -->|Native High-Res Stream| BUF[Storage Video Buffer]
-    
-    P1 -->|Crime Score >= 0.5| CTL{System Control / Trigger}
-    
-    CTL -->|Fetch Incident Clip| BUF
-    BUF --> CLIP[Full-Resolution Incident Clip]
-    
-    CLIP --> P2[Phase 2: SlowFast Network\nAction Classification\n'WHAT']
-    CLIP --> P3[Phase 3: YOLOv5\nWeapon & Threat Object Detection\n'HOW']
-    CLIP --> P4[Phase 4: RetinaFace + ArcFace\nFace Detection & Recognition\n'WHO']
-    
-    P2 --> AGG[Incident Aggregator & Dossier Generator]
-    P3 --> AGG
-    P4 --> AGG
-    
-    AGG --> ALERT[🚨 Automated Police Alert & Dispatch]
-    AGG --> DASH[Phase 5: Web UI Dashboard & Reviewer]
-```
+![System Architecture](Architecture.jpeg)
 
 ---
 
