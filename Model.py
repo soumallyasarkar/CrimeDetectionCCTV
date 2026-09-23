@@ -53,23 +53,76 @@ def set_seed(seed=SEED):
 
 set_seed(SEED)
 
+# ==============================================================================
+# HARDWARE SELECTION & DIAGNOSTICS
+# ==============================================================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print("\n" + "=" * 70)
 if torch.cuda.is_available():
-    print(f"GPU Detected: {torch.cuda.get_device_name(0)}")
+    gpu_name = torch.cuda.get_device_name(0)
+    gpu_count = torch.cuda.device_count()
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    print(f"[HARDWARE] GPU DETECTED: Using '{gpu_name}'")
+    print(f"   - Active GPU Count  : {gpu_count}")
+    print(f"   - Dedicated VRAM    : {vram_gb:.2f} GB")
+    print(f"   - CUDA Driver / Ver : {torch.version.cuda}")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 else:
-    torch.set_num_threads(min(12, os.cpu_count() or 4))
-    print(f"Using CPU for execution ({torch.get_num_threads()} parallel OpenMP CPU threads).")
+    cpu_threads = min(12, os.cpu_count() or 4)
+    torch.set_num_threads(cpu_threads)
+    print(f"[HARDWARE] GPU NOT DETECTED: Falling back to CPU execution.")
+    print(f"   - Allocated Cores   : {cpu_threads} parallel OpenMP CPU threads")
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        print(f"   - Filter Active     : CUDA_VISIBLE_DEVICES='{os.environ['CUDA_VISIBLE_DEVICES']}'")
+print("=" * 70 + "\n")
 
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
+VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.m4v', '.wmv')
+
+
+def resolve_dataset_dirs(root_data="Dataset"):
+    """
+    Exclusively targets and resolves paths for the Real Life Violence Dataset:
+      - Violence/ (1,000 clips)
+      - NonViolence/ (1,000 clips)
+    """
+    candidates = [
+        os.path.join(root_data, "real-life-violence-situations-dataset", "real life violence situations", "Real Life Violence Dataset"),
+        os.path.join(root_data, "Real Life Violence Dataset"),
+        os.path.join(root_data, "Violence"),
+    ]
+
+    for base in candidates:
+        if os.path.basename(base) == "Violence":
+            v_dir = base
+            nv_dir = os.path.join(os.path.dirname(base), "NonViolence")
+        else:
+            v_dir = os.path.join(base, "Violence")
+            nv_dir = os.path.join(base, "NonViolence")
+
+        if os.path.isdir(v_dir) and os.path.isdir(nv_dir):
+            return v_dir, nv_dir
+
+    # Default direct path to Real Life Violence Dataset
+    default_base = os.path.join(
+        root_data,
+        "real-life-violence-situations-dataset",
+        "real life violence situations",
+        "Real Life Violence Dataset"
+    )
+    return os.path.join(default_base, "Violence"), os.path.join(default_base, "NonViolence")
+
+
 class Config:
-    ROOT_DATA = "Dataset/"
-    VIOLENCE_DIR = os.path.join(ROOT_DATA, "Violence")
-    NON_VIOLENCE_DIR = os.path.join(ROOT_DATA, "NonViolence")
+    ROOT_DATA = "Dataset"
+    
+    # Exclusively configure Real Life Violence Dataset
+    VIOLENCE_DIR, NON_VIOLENCE_DIR = resolve_dataset_dirs(ROOT_DATA)
 
     OUTPUT_DIR = "models1"
     BEST_MODEL_PATH = os.path.join(OUTPUT_DIR, "best_3dcnn_crime_detector.pth")
@@ -91,8 +144,6 @@ class Config:
     # Early Stopping & Checkpointing Settings
     EARLY_STOP_PATIENCE   = 10     # Stop if validation metric does not improve for 10 consecutive epochs
     OVERFIT_GAP_THRESHOLD = 20.0   # Stop if train_acc > val_acc by more than 20% after epoch 20
-
-VIDEO_EXTENSIONS = ('.mp4', '.avi', '.mov', '.mkv', '.m4v', '.wmv')
 
 # ==============================================================================
 # DATASET LOADER, MOTION PREPROCESSING & AUGMENTATION
@@ -258,6 +309,13 @@ def prepare_dataset():
     Scans video directories and performs an 80/10/10 stratified split by video files
     to prevent data leakage between train, validation, and test sets.
     """
+    # Dynamically verify and resolve directories
+    vio_dir, non_dir = resolve_dataset_dirs(Config.ROOT_DATA)
+    if vio_dir:
+        Config.VIOLENCE_DIR = vio_dir
+    if non_dir:
+        Config.NON_VIOLENCE_DIR = non_dir
+
     def get_files(folder):
         if not os.path.exists(folder):
             return []
@@ -271,9 +329,26 @@ def prepare_dataset():
 
     if len(vio_files) == 0 or len(non_files) == 0:
         raise FileNotFoundError(
-            f"Dataset check failed! Violence videos: {len(vio_files)}, "
-            f"Non-violence videos: {len(non_files)}. Verify '{Config.ROOT_DATA}' directory."
+            f"Dataset check failed! Could not find video files in detected directories:\n"
+            f"  Violence Dir ({len(vio_files)} videos): {Config.VIOLENCE_DIR}\n"
+            f"  Non-Violence Dir ({len(non_files)} videos): {Config.NON_VIOLENCE_DIR}\n"
+            f"Please ensure videos (.mp4, .avi, etc.) exist under '{Config.ROOT_DATA}'."
         )
+
+    print(f"Resolved Dataset Folders:")
+    print(f"  Violence Videos     : {len(vio_files)} files in '{Config.VIOLENCE_DIR}'")
+    print(f"  Non-Violence Videos : {len(non_files)} files in '{Config.NON_VIOLENCE_DIR}'")
+
+    # Create convenience symlinks Dataset/Violence and Dataset/NonViolence if missing
+    try:
+        sym_vio = os.path.join(Config.ROOT_DATA, "Violence")
+        sym_non = os.path.join(Config.ROOT_DATA, "NonViolence")
+        if not os.path.exists(sym_vio) and os.path.abspath(sym_vio) != os.path.abspath(Config.VIOLENCE_DIR):
+            os.symlink(os.path.abspath(Config.VIOLENCE_DIR), sym_vio)
+        if not os.path.exists(sym_non) and os.path.abspath(sym_non) != os.path.abspath(Config.NON_VIOLENCE_DIR):
+            os.symlink(os.path.abspath(Config.NON_VIOLENCE_DIR), sym_non)
+    except OSError:
+        pass
 
     all_paths = vio_files + non_files
     all_labels = [1] * len(vio_files) + [0] * len(non_files)
